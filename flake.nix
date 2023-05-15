@@ -16,8 +16,9 @@
         };
       in
       {
-        devShell = pkgs.mkShell {
+        devShell = with pkgs; mkShell {
           inputsFrom = [ crateOverrides ];
+          LD_LIBRARY_PATH = lib.makeLibraryPath ([ stdenv.cc ] ++ crateOverrides.buildInputs);
         };
       });
 }
