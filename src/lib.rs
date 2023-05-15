@@ -9,6 +9,21 @@ use syn::{spanned::Spanned, *};
 // TODO handle mutable refs and pass to inner macro
 // TODO handle options and update arity
 
+fn is_type(ty: &Type, id: &str) -> bool {
+    match ty {
+        Type::Path(TypePath { path, .. }) => path
+            .segments
+            .last()
+            .map(|s| s.ident == id)
+            .unwrap_or_default(),
+        _ => false,
+    }
+}
+
+fn is_result(ty: &Type) -> bool {
+    is_type(ty, "Result")
+}
+
 /// Wraps a function making it callable from Janet. The wrapped function can accept any number of
 /// arguments that implement [TryFrom<Janet>].
 #[proc_macro_attribute]
@@ -16,6 +31,8 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let f = parse_macro_input!(input as syn::Item);
 
     let ts = if let syn::Item::Fn(f) = f {
+        let output_result = matches!(f.sig.output, ReturnType::Type(_, ref ty) if is_result(ty));
+
         let mut outer = f.clone();
         // Rewrite the outer to receive &mut [Janet]. TODO: check mut
         outer.sig.inputs = parse_quote! { args: &mut [Janet] };
@@ -46,21 +63,36 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
             .unzip();
 
         // Output.
-        // TODO: insert #[janet_fn]
-        // TODO: insert #[inline] on inner
+        // TODO: insert #[janet_fn] attributes
         let outer_attrs = outer.attrs;
         let outer_vis = outer.vis;
         let outer_name = outer.sig.ident;
         let inner_name = inner.sig.ident.clone();
 
+        let call_inner = quote! { #inner_name(#(#idents),*) };
+
+        // If the output type is a Result, unwrap it first.
+        let call_inner = if output_result {
+            quote! {
+                let res = #call_inner.unwrap_or_else(|e| ::janetrs::jpanic!("error: {}", e));
+                res.into()
+            }
+        } else {
+            quote! {
+                let res = #call_inner;
+                res.into()
+            }
+        };
+
         quote! {
-            #(#outer_attrs)* #outer_vis fn #outer_name(args: &mut [Janet]) -> Janet {
+            #[janet_fn]
+            #(#outer_attrs)* #outer_vis fn #outer_name(args: &mut [::janetrs::Janet]) -> ::janetrs::Janet {
+                #[inline]
                 #inner
 
                 #(#args)*
 
-                let res = #inner_name(#(#idents),*);
-                res
+                #call_inner
             }
         }
     } else {
@@ -69,7 +101,7 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    eprintln!("{}", ts.to_string());
+    //eprintln!("{}", ts.to_string());
 
     ts.into()
 }
