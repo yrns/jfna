@@ -3,8 +3,6 @@ use quote::*;
 use syn::{spanned::Spanned, *};
 
 // TODO handle JanetAbstract
-// TODO handle Result in the output (requires inner function)
-// TODO handle Into<Janet> in output?
 // TODO strip unneeded elements from the inner
 // TODO handle mutable refs and pass to inner macro
 // TODO handle options and update arity
@@ -51,12 +49,10 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
                     FnArg::Receiver(_) => {
                         quote_spanned! { arg.span() => compile_error!("found receiver") }
                     }
-                    FnArg::Typed(pat) => {
-                        // TODO better error message
+                    FnArg::Typed(PatType { pat, ty, .. }) => {
                         // TODO check for nil if the inner input is an Option
-                        let ty = &pat.ty;
                         quote! {
-                            let #ident: #ty = args[#i].try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("wrong arg type"));
+                            let #ident: #ty = args[#i].try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("wrong arg type ({}): {}: {} got: {:?}", #i, stringify!(#pat), stringify!(#ty), args[#i]));
                         }
                     },
                 }, ident)})
