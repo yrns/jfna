@@ -57,6 +57,12 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
         // Strip inner attrs?
         inner.vis = Visibility::Inherited;
 
+        let unwrap_arg = |id, ty, i| {
+            quote! {
+                let #id: #ty = args[#i].try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("wrong arg type ({}): expected: {} got: {:?}", #i, stringify!(#ty), args[#i]));
+            }
+        };
+
         let (unwrap_args, (idents, is_opts)): (Vec<_>, (Vec<_>, Vec<_>)) = f
             .sig
             .inputs
@@ -74,26 +80,28 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
                         quote_spanned! { arg.span() => compile_error!("found receiver") }
                     }
                     // Check that pat is an identifier?
-                    FnArg::Typed(PatType { pat, ty, .. }) => {
+                    FnArg::Typed(PatType { ty, .. }) => {
                         // If we are expecting an Option, check for nil and convert.
                         if let Some(path) = is_option(ty) {
                             opt = true;
+                            let ty = quote! { #path };
+                            let try_unwrap = unwrap_arg(ident.clone(), ty, i);
                             quote! {
                                 let #ident = if #i >= args.len() || args[#i].is_nil() {
                                     None
                                 } else {
-                                    let #ident: #path = args[#i].try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("wrong arg type ({}): {}: {} got: {:?}", #i, stringify!(#pat), stringify!(#path), args[#i]));
+                                    #try_unwrap
                                     Some(#ident)
                                 };
                             }
                         } else {
-                            quote! {
-                                let #ident: #ty = args[#i].try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("wrong arg type ({}): {}: {} got: {:?}", #i, stringify!(#pat), stringify!(#ty), args[#i]));
-                            }
+                            let ty = quote! { #ty };
+                            unwrap_arg(ident.clone(), ty, i)
                         }
-                    },
+                    }
                 };
-                (ts, (ident, opt))})
+                (ts, (ident, opt))
+            })
             .unzip();
 
         // Trailing Options are optional.
