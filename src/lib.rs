@@ -1,20 +1,6 @@
-// use janetrs::{
-//     janet_abstract::AbstractError, IsJanetAbstract, Janet, JanetAbstract, JanetConversionError,
-// };
 use proc_macro::TokenStream;
 use quote::*;
 use syn::{spanned::Spanned, *};
-
-// enum MaybeAbstractError {
-//     Abstract(AbstractError),
-//     Kind(JanetConversionError),
-// }
-
-// We don't need this anymore but JanetAbstract needs a lifetime...
-// enum MaybeAbstract {
-//     Abstract(JanetAbstract),
-//     Janet(Janet),
-// }
 
 // Support/test more native rust types (i.e. &str).
 // TODO accept a final "rest" arg with a subslice?
@@ -51,7 +37,8 @@ fn is_option(ty: &Type) -> Option<&Type> {
 /// Wraps a function making it callable from Janet. The wrapped function can accept any number of
 /// arguments that implement [TryFrom<Janet>]. Options in the inputs are nil-checked. Consecutive
 /// trailing Options are considered optional when checking arity. A Result in the output is
-/// unwrapped before returning to Janet.
+/// unwrapped before returning to Janet. If the input type is a reference it is assumed to implement
+/// [IsJanetAbstract] and unwrapped accordingly.
 #[proc_macro_attribute]
 pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let f = parse_macro_input!(input as syn::Item);
@@ -63,7 +50,7 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
             matches!(f.sig.output, ReturnType::Type(_, ref ty) if is_result(ty).is_some());
 
         let mut outer = f.clone();
-        // Rewrite the outer to receive &mut [Janet]. TODO: check mut
+        // Rewrite the outer to receive &mut [Janet].
         outer.sig.inputs = parse_quote! { args: &mut [Janet] };
 
         let mut inner = f.clone();
@@ -71,32 +58,6 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
         // Strip inner attrs?
         inner.vis = Visibility::Inherited;
-
-        // The assumption here is that any ref type is an abstract type and anything else converts
-        // directly from a Janet.
-        let unwrap_arg = |id, ty: &Type, i| {
-            match ty {
-                Type::Path(ty) => quote! {
-                    let #id: #ty = args.get_panic(#i);
-                },
-                Type::Reference(TypeReference { mutability, .. }) => {
-                    let get_fn = match mutability {
-                        Some(_) => quote! { get_mut },
-                        _ => quote! { get },
-                    };
-                    let id_abs = format_ident!("{}_abstract", id);
-                    quote! {
-                        let #id_abs: JanetAbstract = args.get_panic(#i);
-                        let #id: #ty = #id_abs.#get_fn().unwrap_or_else(|e| ::janetrs::jpanic!("bad slot #{}: {}", #i, e));
-                    }
-                }
-                //Type::Slice(_) => todo!(),
-                //Type::Tuple(_) => todo!(),
-                _ => {
-                    quote_spanned! { ty.span() => ::janetrs::panic!("invalid input type: {}", ty) }
-                }
-            }
-        };
 
         let (unwrap_args, (idents, is_opts)): (Vec<_>, (Vec<_>, Vec<_>)) = f
             .sig
@@ -107,6 +68,11 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
                 // Create a new local identifier for each argument.
                 let ident = format_ident!("arg{}", i);
 
+                // This is used to hold the abstract value. The lifetime of the inner reference is
+                // not tied to the original Janet, so we have to keep this around until we call the
+                // inner function.
+                let ident_abs = format_ident!("arg{}_abs", i);
+
                 // Track optional arguments.
                 let mut opt = false;
 
@@ -116,20 +82,47 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
                     }
                     // Check that pat is an identifier?
                     FnArg::Typed(PatType { ty, .. }) => {
-                        // If we are expecting an Option, check for nil and convert. TODO: get_option on JanetArgs?
-                        if let Some(ty) = is_option(ty) {
+                        // This covers Option<T> and T, where T is any of T or &T or &mut T:
+                        if let Some(inner_ty) = is_option(ty) {
                             opt = true;
-                            let try_unwrap = unwrap_arg(ident.clone(), ty, i);
-                            quote! {
-                                let #ident = if #i >= args.len() || args[#i].is_nil() {
-                                    None
-                                } else {
-                                    #try_unwrap
-                                    Some(#ident)
-                                };
+                            match inner_ty {
+                                Type::Path(_) => quote! {
+                                    let #ident: #ty = args.get(#i).filter(|j| !j.is_nil()).map(|j| j.try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("bad slot #{}, expected {}, got {}", #i, stringify!(ty), j.kind())));
+                                },
+                                Type::Reference(TypeReference { mutability, .. }) => {
+                                    let get = match mutability {
+                                        Some(_) => quote! { get_mut },
+                                        _ => quote! { get },
+                                    };
+                                    quote! {
+                                        let #ident_abs: Option<JanetAbstract> = args.get(#i).filter(|j| !j.is_nil()).map(|j| j.try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("bad slot #{}, expected Abstract, got {}", #i, j.kind())));
+                                        let #ident: #ty = #ident_abs.as_ref().map(|a| a.#get().unwrap_or_else(|e| ::janetrs::jpanic!("bad slot #{}, expected {}, got abstract error {}", #i, stringify!(#ty), e)));
+                                    }
+                                }
+                                _ => {
+                                    quote_spanned! { ty.span() => ::janetrs::panic!("invalid input type: {}", ty) }
+                                }
                             }
                         } else {
-                            unwrap_arg(ident.clone(), ty.as_ref(), i)
+                            match ty.as_ref() {
+                                Type::Path(_) => quote! {
+                                    let #ident: #ty = args.get(#i).unwrap().try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("bad slot #{}, expected {}, got {}", #i, stringify!(ty), j.kind()));
+                                },
+                                Type::Reference(TypeReference { mutability, .. }) => {
+                                    let get = match mutability {
+                                        Some(_) => quote! { get_mut },
+                                        _ => quote! { get },
+                                    };
+                                    quote! {
+                                        let arg = args.get(#i).unwrap();
+                                        let #ident_abs: JanetAbstract = arg.try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("bad slot #{}, expected Abstract, got {}", #i, arg.kind()));
+                                        let #ident: #ty = #ident_abs.#get().unwrap_or_else(|e| ::janetrs::jpanic!("bad slot #{}, expected {}, got abstract error {}", #i, stringify!(#ty), e));
+                                    }
+                                }
+                                _ => {
+                                    quote_spanned! { ty.span() => ::janetrs::panic!("invalid input type: {}", ty) }
+                                }
+                            }
                         }
                     }
                 };
