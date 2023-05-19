@@ -1,12 +1,25 @@
+// use janetrs::{
+//     janet_abstract::AbstractError, IsJanetAbstract, Janet, JanetAbstract, JanetConversionError,
+// };
 use proc_macro::TokenStream;
 use quote::*;
 use syn::{spanned::Spanned, *};
 
-// TODO handle JanetAbstract
-// TODO handle mutable refs and pass to inner macro
+// enum MaybeAbstractError {
+//     Abstract(AbstractError),
+//     Kind(JanetConversionError),
+// }
+
+// We don't need this anymore but JanetAbstract needs a lifetime...
+// enum MaybeAbstract {
+//     Abstract(JanetAbstract),
+//     Janet(Janet),
+// }
+
+// Support/test more native rust types (i.e. &str).
 // TODO accept a final "rest" arg with a subslice?
 
-fn is_container_type<'a>(ty: &'a Type, container_id: &'static str) -> Option<&'a Path> {
+fn is_container_type<'a>(ty: &'a Type, container_id: &'static str) -> Option<&'a Type> {
     match ty {
         Type::Path(TypePath { path, .. }) => path.segments.last().and_then(|s| {
             if s.ident == container_id {
@@ -14,7 +27,7 @@ fn is_container_type<'a>(ty: &'a Type, container_id: &'static str) -> Option<&'a
                     PathArguments::AngleBracketed(AngleBracketedGenericArguments {
                         args, ..
                     }) => args.first().and_then(|arg| match arg {
-                        GenericArgument::Type(Type::Path(TypePath { path, .. })) => Some(path),
+                        GenericArgument::Type(ty) => Some(ty),
                         _ => None,
                     }),
                     _ => None,
@@ -27,11 +40,11 @@ fn is_container_type<'a>(ty: &'a Type, container_id: &'static str) -> Option<&'a
     }
 }
 
-fn is_result(ty: &Type) -> Option<&Path> {
+fn is_result(ty: &Type) -> Option<&Type> {
     is_container_type(ty, "Result")
 }
 
-fn is_option(ty: &Type) -> Option<&Path> {
+fn is_option(ty: &Type) -> Option<&Type> {
     is_container_type(ty, "Option")
 }
 
@@ -42,6 +55,8 @@ fn is_option(ty: &Type) -> Option<&Path> {
 #[proc_macro_attribute]
 pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let f = parse_macro_input!(input as syn::Item);
+
+    //eprintln!("{:?}", _attr);
 
     let ts = if let syn::Item::Fn(f) = f {
         let output_result =
@@ -57,9 +72,29 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
         // Strip inner attrs?
         inner.vis = Visibility::Inherited;
 
-        let unwrap_arg = |id, ty, i| {
-            quote! {
-                let #id: #ty = args[#i].try_unwrap().unwrap_or_else(|_e| ::janetrs::jpanic!("wrong arg type ({}): expected: {} got: {:?}", #i, stringify!(#ty), args[#i]));
+        // The assumption here is that any ref type is an abstract type and anything else converts
+        // directly from a Janet.
+        let unwrap_arg = |id, ty: &Type, i| {
+            match ty {
+                Type::Path(ty) => quote! {
+                    let #id: #ty = args.get_panic(#i);
+                },
+                Type::Reference(TypeReference { mutability, .. }) => {
+                    let get_fn = match mutability {
+                        Some(_) => quote! { get_mut },
+                        _ => quote! { get },
+                    };
+                    let id_abs = format_ident!("{}_abstract", id);
+                    quote! {
+                        let #id_abs: JanetAbstract = args.get_panic(#i);
+                        let #id: #ty = #id_abs.#get_fn().unwrap_or_else(|e| ::janetrs::jpanic!("bad slot #{}: {}", #i, e));
+                    }
+                }
+                //Type::Slice(_) => todo!(),
+                //Type::Tuple(_) => todo!(),
+                _ => {
+                    quote_spanned! { ty.span() => ::janetrs::panic!("invalid input type: {}", ty) }
+                }
             }
         };
 
@@ -81,10 +116,9 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
                     }
                     // Check that pat is an identifier?
                     FnArg::Typed(PatType { ty, .. }) => {
-                        // If we are expecting an Option, check for nil and convert.
-                        if let Some(path) = is_option(ty) {
+                        // If we are expecting an Option, check for nil and convert. TODO: get_option on JanetArgs?
+                        if let Some(ty) = is_option(ty) {
                             opt = true;
-                            let ty = quote! { #path };
                             let try_unwrap = unwrap_arg(ident.clone(), ty, i);
                             quote! {
                                 let #ident = if #i >= args.len() || args[#i].is_nil() {
@@ -95,8 +129,7 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
                                 };
                             }
                         } else {
-                            let ty = quote! { #ty };
-                            unwrap_arg(ident.clone(), ty, i)
+                            unwrap_arg(ident.clone(), ty.as_ref(), i)
                         }
                     }
                 };
@@ -126,12 +159,12 @@ pub fn jfna(_attr: TokenStream, input: TokenStream) -> TokenStream {
         let call_inner = if output_result {
             quote! {
                 let res = #call_inner.unwrap_or_else(|e| ::janetrs::jpanic!("error: {}", e));
-                res.into()
+                res.into() // Janet
             }
         } else {
             quote! {
                 let res = #call_inner;
-                res.into()
+                res.into() // Janet
             }
         };
 
